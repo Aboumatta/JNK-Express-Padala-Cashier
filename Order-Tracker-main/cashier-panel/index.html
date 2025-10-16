@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>JNK Express — Cashier Panel</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; }
+    .container { max-width:800px; margin:0 auto; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    input[type="text"] { padding:8px; font-size:16px; width:60%; }
+    button { padding:10px 14px; font-size:16px; }
+    .log { margin-top:16px; border:1px solid #ddd; padding:12px; height:260px; overflow:auto; white-space:pre-wrap; background:#fafafa; }
+    .status { margin-top:12px; }
+    .row { margin-top:8px; display:flex; gap:8px; align-items:center; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Cashier Panel</h1>
+      <div>
+        <span id="cashierName">Not signed in</span>
+        <button id="signOutBtn" style="display:none">Sign out</button>
+      </div>
+    </header>
+
+    <p>This panel is meant for cashiers to scan tracking-number barcodes and mark parcels as <strong>Claimed</strong> and record simple product sales.</p>
+
+    <!-- Using existing firebase config: ../Order-Tracker-main/admin.html -->
+    <script src="../Order-Tracker-main/admin.html"></script>
+
+    <div class="row">
+      <input id="scanInput" type="text" placeholder="Scan or type tracking number / product barcode and press Enter" autofocus />
+      <button id="processBtn">Process</button>
+    </div>
+
+    <div class="row status">
+      <label><input type="checkbox" id="isProduct" /> This is a product sale (decrease inventory)</label>
+    </div>
+
+    <div class="row">
+      <input id="productQty" type="number" placeholder="Quantity (for product)" style="width:150px;" value="1" />
+      <input id="productCode" type="text" placeholder="Product code (optional)" style="width:250px;" />
+    </div>
+
+    <div class="log" id="log"></div>
+
+    <script>
+    // cashier.js inlined
+    (function(){{
+      // simple logger
+      function log(msg){{ const l=document.getElementById('log'); l.textContent = (new Date()).toLocaleString() + " — " + msg + "\n" + l.textContent; }}
+
+      // wait for firebase to exist
+      function ready(){{ return typeof firebase !== 'undefined' && firebase.apps && firebase.apps.length>0; }}
+
+      function init(){{
+        if(!ready()){{ log('Firebase not detected. The cashier panel requires Firebase to be loaded and initialized.'); return; }}
+
+        // try to get firestore and auth
+        const db = firebase.firestore ? firebase.firestore() : (firebase.database ? null : null);
+        const auth = firebase.auth();
+        if(!auth){{ log('Firebase Auth not available'); }}
+
+        // Simple anonymous sign-in for cashier (or you can integrate proper auth)
+        auth.onAuthStateChanged(user => {{
+          if(user){{ document.getElementById('cashierName').textContent = 'Cashier: ' + (user.displayName || user.email || user.uid); document.getElementById('signOutBtn').style.display='inline-block'; }}
+          else {{ document.getElementById('cashierName').textContent = 'Not signed in'; document.getElementById('signOutBtn').style.display='none'; }}
+        }});
+
+        // auto sign-in anonymously if no user
+        if(!auth.currentUser) auth.signInAnonymously().catch(e=>log('Auth error: '+e.message));
+
+        document.getElementById('signOutBtn').addEventListener('click', ()=>auth.signOut());
+
+        const input = document.getElementById('scanInput');
+        const btn = document.getElementById('processBtn');
+        btn.addEventListener('click', ()=>handleInput(input.value.trim()));
+        input.addEventListener('keydown', (e)=>{ if(e.key==='Enter') handleInput(input.value.trim()); });
+
+        async function handleInput(value){
+          if(!value){ log('Empty input'); return; }
+          const isProduct = document.getElementById('isProduct').checked;
+          const qty = parseInt(document.getElementById('productQty').value) || 1;
+          const productCode = document.getElementById('productCode').value.trim();
+
+          try{{
+            const timestamp = firebase.firestore.FieldValue.serverTimestamp ? firebase.firestore.FieldValue.serverTimestamp() : new Date();
+            if(isProduct){{
+              // product sale: decrease from 'products' collection by code or barcode
+              if(!db){{ log('Firestore not available'); return; }}
+              let queryField = 'code';
+              if(productCode) queryField = 'code';
+              // try to find product by code or barcode
+              const q = await db.collection('products').where(queryField,'==', productCode || value).limit(1).get();
+              if(q.empty){{
+                log('Product not found in inventory for code/barcode: ' + (productCode || value) );
+              }} else {{
+                const doc = q.docs[0];
+                const data = doc.data();
+                const newQty = (data.quantity || 0) - qty;
+                await db.collection('products').doc(doc.id).update({ quantity: newQty });
+                // record sale
+                await db.collection('sales').add({ productId: doc.id, productCode: data.code || productCode || value, qty: qty, cashier: auth.currentUser.uid, timestamp: timestamp });
+                log('Recorded product sale. ' + (data.name || data.code || value) + ' — new qty: ' + newQty);
+              }}
+            }} else {{
+              // parcel claim: mark tracking document as Claimed and add cashier log
+              if(!db){{ log('Firestore not available'); return; }}
+              // assume tracking documents are in collection 'tracking' and have field 'trackingNumber' or document id equals tracking number
+              // try to find document by trackingNumber field
+              const q = await db.collection('tracking').where('trackingNumber','==',value).limit(1).get();
+              if(!q.empty){{
+                const doc = q.docs[0];
+                await db.collection('tracking').doc(doc.id).update({ status: 'Claimed', claimedBy: auth.currentUser.uid, claimedAt: timestamp });
+                await db.collection('cashierLogs').add({ trackingId: doc.id, trackingNumber: value, action: 'claimed', cashier: auth.currentUser.uid, timestamp: timestamp });
+                log('Parcel marked as Claimed: ' + value);
+              }} else {{
+                // maybe doc id is the tracking number
+                const docRef = db.collection('tracking').doc(value);
+                const docSnap = await docRef.get();
+                if(docSnap.exists){{
+                  await docRef.update({ status: 'Claimed', claimedBy: auth.currentUser.uid, claimedAt: timestamp });
+                  await db.collection('cashierLogs').add({ trackingId: value, trackingNumber: value, action: 'claimed', cashier: auth.currentUser.uid, timestamp: timestamp });
+                  log('Parcel (by doc id) marked as Claimed: ' + value);
+                }} else {{
+                  log('Tracking number not found: ' + value);
+                }}
+              }}
+            }}
+          }}catch(err){{ log('Error processing: ' + err.message); }}
+          document.getElementById('scanInput').value='';
+        }
+      }}
+
+      // wait until firebase present, then init
+      const chk = setInterval(()=>{{ if(typeof firebase !== 'undefined'){{ clearInterval(chk); init(); }} }}, 300);
+      setTimeout(()=>{{ if(typeof firebase === 'undefined') document.getElementById('log').textContent = 'Firebase not detected. Please ensure firebase scripts and initialization are loaded.'; }}, 2000);
+    }})();
+    </script>
+  </div>
+</body>
+</html>
